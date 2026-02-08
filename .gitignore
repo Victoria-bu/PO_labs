@@ -1,0 +1,10 @@
+main
+lab1
+lab1_debug
+lab1_release
+*.dSYM/
+*.dSYM
+.vscode/
+.idea/
+*.swp
+*.swo
