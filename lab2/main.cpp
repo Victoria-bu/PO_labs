@@ -7,6 +7,7 @@
 #include <limits>
 #include <thread>
 #include <mutex>
+#include <atomic>
 
 using namespace std;
 using namespace chrono;
@@ -74,15 +75,61 @@ Result parallelWithMutex(const vector<int>& data, int numThreads) {
     return result;
 }
 
+// З використанням CAS (атомарні змінні)
+void workerWithCAS(int start, int end, const vector<int>& data, atomic<int>& atomicCount, atomic<int>& atomicMin) {
+    int localCount = 0;
+    int localMin = INT32_MAX;
+    
+    for (int i = start; i < end; i++) {
+        if (data[i] < 0) {
+            localCount++;
+            if (data[i] < localMin) {
+                localMin = data[i];
+            }
+        }
+    }
+    atomicCount.fetch_add(localCount, memory_order_relaxed);
+    
+    int currentMin = atomicMin.load(memory_order_relaxed);
+    while (localMin < currentMin) {
+        if (atomicMin.compare_exchange_weak(currentMin, localMin, memory_order_relaxed)) {
+            break; 
+        }
+    }
+}
+
+Result parallelWithCAS(const vector<int>& data, int numThreads) {
+    atomic<int> atomicCount(0);
+    atomic<int> atomicMin(INT32_MAX);
+    vector<thread> threads;
+    
+    int chunkSize = data.size() / numThreads;
+    
+    for (int t = 0; t < numThreads; t++) {
+        int start = t * chunkSize;
+        int end = (t == numThreads - 1) ? data.size() : start + chunkSize;
+        threads.emplace_back(workerWithCAS, start, end, cref(data), ref(atomicCount), ref(atomicMin));
+    }
+    
+    for (auto& th : threads) {
+        th.join();
+    }
+    
+    Result result;
+    result.count = atomicCount.load();
+    result.minValue = atomicMin.load();
+    return result;
+}
+
 vector<int> generateData(size_t size) {
     vector<int> data(size);
     srand(static_cast<unsigned>(time(nullptr)));
     
     // Рандомні числа від -500 до 500
-    for (size_t i = 0; i < size; ++i) {
+    for (size_t i = 0; i < size; i++) {
         data[i] = (rand() % 1001) - 500;
     }
-    
+
     return data;
 }
 
@@ -90,7 +137,7 @@ void testSmallArray(const vector<int>& data) {
     if (data.size() <= 50) { 
         cout << "\n--- test ---\n";
         cout << "Elements:\n";
-        for (size_t i = 0; i < data.size(); ++i) {
+        for (size_t i = 0; i < data.size(); i++) {
             cout << "data[" << i << "] = " << data[i];
             if (data[i] < 0) cout << " <-- negative";
             cout << "\n";
@@ -151,7 +198,7 @@ int main() {
             double mutexTime = duration<double>(endMutex - startMutex).count();
             
             cout << "Threads: " << numThreads 
-                 << ", Time: " << fixed << setprecision(8) << mutexTime << " s\n";
+                 << ", Time: " << fixed << setprecision(6) << mutexTime << " s\n";
             
             if (size <= 100) {
                 cout << "  Count: " << mutexResult.count 
@@ -164,7 +211,27 @@ int main() {
             }
         }
         cout << string(50, '-') << "\n";
+
+        // CAS
+        cout << "\nCAS: \n";
+        for (int numThreads : threadCounts) {
+            auto startCAS = high_resolution_clock::now();
+            Result casResult = parallelWithCAS(data, numThreads);
+            auto endCAS = high_resolution_clock::now();
+            double casTime = duration<double>(endCAS - startCAS).count();
+            
+            cout << "Threads: " << setw(3) << numThreads 
+                 << " | Time: " << fixed << setprecision(6) << casTime << " s";
+            
+            if (size <= 100) {
+                if (casResult.count == seqResult.count && casResult.minValue == seqResult.minValue) {
+                    cout << " \nGood!";
+                } else {
+                    cout << " \nERROR!";
+                }
+            }
+            cout << "\n";
+        }
     }
-    
     return 0;
 }
