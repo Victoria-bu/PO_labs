@@ -34,23 +34,17 @@ Result sequentialSearch(const vector<int>& data) {
 }
 
 // З використанням м'ютексів
-void workerWithMutex(int start, int end, const vector<int>& data, int& globalCount, int& globalMin, mutex& mtx) {
-    int localCount = 0;
-    int localMin = INT32_MAX;
+void workerWithMutex(int start, int end, const vector<int>& data, 
+                     int& globalCount, int& globalMin, mutex& mtx) {
     
     for (int i = start; i < end; i++) {
         if (data[i] < 0) {
-            localCount++;
-            if (data[i] < localMin) {
-                localMin = data[i];
+            lock_guard<mutex> lock(mtx);
+            globalCount++; 
+            if (data[i] < globalMin) {  
+                globalMin = data[i]; 
             }
         }
-    }
-    
-    lock_guard<mutex> lock(mtx);
-    globalCount += localCount;
-    if (localMin < globalMin) {
-        globalMin = localMin;
     }
 }
 
