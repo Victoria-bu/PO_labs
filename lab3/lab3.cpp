@@ -90,21 +90,24 @@ void task_queue<task_type_t>::emplace(arguments&&... parameters) {
 
 class thread_pool;
 
-// СТРУКТУРА ДЛЯ СТАТИСТИКИ
+//СТРУКТУРА ДЛЯ СТАТИСТИКИ
 struct ThreadPoolStats {
-    size_t total_threads_created = 0;
+    size_t total_threads_created = 0; // Кількість створених потоків
     
-    atomic<long long> total_wait_time_us{0};
+    atomic<long long> total_wait_time_us{0};  // Для часу очікування (в мікросекундах)
     atomic<size_t> wait_samples{0};
     
+    // Для довжини черг
     atomic<long long> queue0_length_sum{0};
     atomic<long long> queue1_length_sum{0};
     atomic<long long> queue2_length_sum{0};
     atomic<size_t> queue_samples{0};
     
+    // Для часу виконання задач
     atomic<long long> total_execution_time_us{0};
     atomic<size_t> completed_tasks{0};
     
+    // Середні значення
     double get_avg_wait_time_ms() const {
         if (wait_samples == 0) return 0;
         return (total_wait_time_us / 1000.0) / wait_samples;
@@ -131,7 +134,6 @@ struct ThreadPoolStats {
     }
     
     void print() {
-        cout << "\nСТАТИСТИКА\n";
         cout << "Кількість створених потоків: " << total_threads_created << "\n";
         cout << "Середній час очікування: " << get_avg_wait_time_ms()/1000 << " с\n";
         cout << "Середня довжина черги 0: " << get_avg_queue0_length() << "\n";
@@ -141,7 +143,7 @@ struct ThreadPoolStats {
     }
 };
 
-// ПУЛ ПОТОКІВ
+//  ПУЛ ПОТОКІВ
 class thread_pool {
 public:
     inline thread_pool() = default;
@@ -157,6 +159,10 @@ public:
     template <typename task_t, typename... arguments>
     void add_task(task_t&& task, arguments&&... parameters);
     
+    void pause();
+    void resume();
+    
+    // Статистика
     ThreadPoolStats stats;
 
 public:
@@ -165,6 +171,7 @@ public:
     thread_pool& operator=(const thread_pool& rhs) = delete;
     thread_pool& operator=(thread_pool&& rhs) = delete;
 
+    // Для моніторингу
     size_t get_queue_size(size_t idx) const;
     size_t get_total_tasks() const { return total_tasks_added; }
     size_t get_completed_tasks() const { return total_tasks_completed; }
@@ -172,12 +179,14 @@ public:
 private:
     mutable read_write_lock m_rw_lock;
     mutable condition_variable_any m_task_waiter;
+    mutable condition_variable_any m_pause_waiter;
     
     vector<thread> m_workers;
     vector<task_queue<function<void()>>> m_queues;
     
     bool m_initialized = false;
     bool m_terminated = false;
+    bool m_paused = false;
     
     atomic<size_t> total_tasks_added{0};
     atomic<size_t> total_tasks_completed{0};
@@ -194,6 +203,23 @@ bool thread_pool::working() const {
 
 bool thread_pool::working_unsafe() const {
     return m_initialized && !m_terminated;
+}
+
+void thread_pool::pause() {
+    write_lock _(m_rw_lock);
+    if (m_initialized && !m_terminated) {
+        m_paused = true;
+    }
+}
+
+void thread_pool::resume() {
+    {
+        write_lock _(m_rw_lock);
+        if (m_initialized && !m_terminated) {
+            m_paused = false;
+        }
+    }
+    m_pause_waiter.notify_all();
 }
 
 void thread_pool::initialize(const size_t queues_count, const size_t workers_per_queue) {
@@ -223,6 +249,13 @@ void thread_pool::routine(size_t queue_index) {
     
     while (true) {
         wait_start = steady_clock::now();
+        // Перевірка на паузу
+        {
+            write_lock _(m_rw_lock);
+            while (m_paused && !m_terminated) {
+                m_pause_waiter.wait(_);
+            }
+        }
         
         bool task_acquired = false;
         function<void()> task;
@@ -248,6 +281,7 @@ void thread_pool::routine(size_t queue_index) {
         }
         
         if (task_acquired) {
+            // Виконуємо задачу і вимірюємо час
             auto exec_start = steady_clock::now();
             task();
             auto exec_end = steady_clock::now();
@@ -279,7 +313,7 @@ template <typename task_t, typename... arguments>
 void thread_pool::add_task(task_t&& task, arguments&&... parameters) {
     {
         read_lock _(m_rw_lock);
-        if (!working_unsafe()) {
+        if (!working_unsafe() || m_paused) {
             return;
         }
     }
@@ -297,6 +331,8 @@ void thread_pool::terminate(bool wait_for_tasks) {
         write_lock _(m_rw_lock);
         if (!m_initialized) return;
         
+        m_paused = false;
+        
         if (!wait_for_tasks) {
             for (auto& q : m_queues) q.clear();
         }
@@ -305,6 +341,7 @@ void thread_pool::terminate(bool wait_for_tasks) {
     }
     
     m_task_waiter.notify_all();
+    m_pause_waiter.notify_all();
     
     for (thread& worker : m_workers) {
         if (worker.joinable()) worker.join();
@@ -322,7 +359,8 @@ size_t thread_pool::get_queue_size(size_t idx) const {
     return m_queues[idx].size();
 }
 
-// ТЕСТОВА ПРОГРАМА
+// ============ ТЕСТОВА ПРОГРАМА ============
+
 int random_int(int min, int max) {
     static random_device rd;
     static mt19937 gen(rd());
@@ -396,8 +434,20 @@ int main() {
     for (int i = 0; i < producers_count; i++) {
         producers.emplace_back(producer, ref(pool), i, tasks_per_producer, ref(running));
     }
+    /*
+    // ТЕСТ ПАУЗИ
+    this_thread::sleep_for(chrono::seconds(5));
     
-    this_thread::sleep_for(chrono::seconds(30));
+    cout << "\n>>> ТЕСТ ПАУЗИ (3 секунди) <<<\n";
+    pool.pause();
+    
+    // Пауза на 3 секунди
+    this_thread::sleep_for(chrono::seconds(3));
+    
+    cout << "\n>>> ВІДНОВЛЕННЯ РОБОТИ <<<\n";
+    pool.resume();
+    */
+    this_thread::sleep_for(chrono::seconds(23));
     
     cout << "\n>>> ЗАВЕРШЕННЯ ТЕСТУВАННЯ <<<\n";
     running = false;
@@ -413,8 +463,8 @@ int main() {
     auto test_duration = duration_cast<seconds>(test_end - test_start).count();
     
     cout << "\nРЕЗУЛЬТАТИ ТЕСТУВАННЯ\n";
-    cout << "Тривалість тесту: " << test_duration << " секунд\n\n";
     pool.stats.print();
+    cout << "Тривалість тесту: " << test_duration << " секунд\n";
     cout << "Всього додано задач: " << pool.get_total_tasks() << "\n";
     cout << "Всього виконано задач: " << pool.get_completed_tasks() << "\n";
     
